@@ -1,0 +1,285 @@
+name: Delete Regional Test VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_id:
+        type: string
+        description: 'Deployment ID (GitHub Run ID from deploy workflow)'
+        required: true
+      confirm_deletion:
+        type: boolean
+        description: '⚠️ CONFIRM VM DELETION (This action cannot be undone!)'
+        required: true
+        default: false
+      force_deletion:
+        type: boolean
+        description: 'Force deletion even if VM is not found'
+        required: false
+        default: false
+
+jobs:
+  delete-vm:
+    runs-on: ubuntu-latest
+    environment: main
+    
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    
+    env:
+      PROJECT_ID: "vsa-ai-prod"
+      DEPLOYMENT_ID: ${{ github.event.inputs.deployment_id }}
+    
+    steps:
+      - name: Validate Deletion Confirmation
+        run: |
+          if [[ "${{ github.event.inputs.confirm_deletion }}" != "true" ]]; then
+            echo "❌ DELETION NOT CONFIRMED"
+            echo "   Please check the confirmation box to proceed with VM deletion."
+            echo "   This is a safety measure to prevent accidental deletions."
+            exit 1
+          fi
+          
+          echo "✅ Deletion confirmed for deployment ID: ${{ env.DEPLOYMENT_ID }}"
+      
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_VSA_PROD }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Download VM Metadata
+        id: download-metadata
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-metadata-${{ env.DEPLOYMENT_ID }}
+          path: ./metadata
+      
+      - name: Extract VM Information
+        id: vm-info
+        run: |
+          if [[ -f ./metadata/vm-metadata.json ]]; then
+            echo "📋 VM metadata found, extracting information..."
+            
+            VM_NAME=$(jq -r '.vm.name' ./metadata/vm-metadata.json)
+            VM_ZONE=$(jq -r '.vm.zone' ./metadata/vm-metadata.json)
+            VM_REGION=$(jq -r '.deployment.region' ./metadata/vm-metadata.json)
+            VM_IP=$(jq -r '.vm.external_ip' ./metadata/vm-metadata.json)
+            FIREWALL_RULE=$(jq -r '.vm.firewall_rule' ./metadata/vm-metadata.json)
+            CREATED_AT=$(jq -r '.deployment.created_at' ./metadata/vm-metadata.json)
+            
+            echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
+            echo "vm_zone=$VM_ZONE" >> $GITHUB_OUTPUT
+            echo "vm_region=$VM_REGION" >> $GITHUB_OUTPUT
+            echo "vm_ip=$VM_IP" >> $GITHUB_OUTPUT
+            echo "firewall_rule=$FIREWALL_RULE" >> $GITHUB_OUTPUT
+            echo "metadata_found=true" >> $GITHUB_OUTPUT
+            
+            echo "🔍 VM Information from metadata:"
+            echo "   Name: $VM_NAME"
+            echo "   Zone: $VM_ZONE"
+            echo "   Region: $VM_REGION"
+            echo "   IP: $VM_IP"
+            echo "   Created: $CREATED_AT"
+            
+          else
+            echo "⚠️ VM metadata not found, will attempt to find VM by deployment ID..."
+            echo "metadata_found=false" >> $GITHUB_OUTPUT
+            
+            # Try to find VM by deployment ID label
+            VM_INFO=$(gcloud compute instances list \
+              --filter="labels.deployment-id=${{ env.DEPLOYMENT_ID }}" \
+              --format="value(name,zone)" \
+              --limit=1)
+            
+            if [[ -n "$VM_INFO" ]]; then
+              VM_NAME=$(echo "$VM_INFO" | awk '{print $1}')
+              VM_ZONE_FULL=$(echo "$VM_INFO" | awk '{print $2}')
+              VM_ZONE=$(basename "$VM_ZONE_FULL")
+              VM_REGION=$(echo "$VM_ZONE" | sed 's/-[a-z]$//')
+              
+              # Get VM IP
+              VM_IP=$(gcloud compute instances describe "$VM_NAME" \
+                --zone="$VM_ZONE" \
+                --format="value(networkInterfaces[0].accessConfigs[0].natIP)" 2>/dev/null || echo "unknown")
+              
+              echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
+              echo "vm_zone=$VM_ZONE" >> $GITHUB_OUTPUT
+              echo "vm_region=$VM_REGION" >> $GITHUB_OUTPUT
+              echo "vm_ip=$VM_IP" >> $GITHUB_OUTPUT
+              echo "firewall_rule=allow-test-services-${{ env.DEPLOYMENT_ID }}" >> $GITHUB_OUTPUT
+              
+              echo "🔍 VM found by deployment ID:"
+              echo "   Name: $VM_NAME"
+              echo "   Zone: $VM_ZONE"
+              echo "   Region: $VM_REGION"
+              echo "   IP: $VM_IP"
+              
+            else
+              if [[ "${{ github.event.inputs.force_deletion }}" == "true" ]]; then
+                echo "⚠️ VM not found, but force deletion is enabled"
+                echo "vm_name=not-found" >> $GITHUB_OUTPUT
+                echo "vm_zone=unknown" >> $GITHUB_OUTPUT
+                echo "vm_region=unknown" >> $GITHUB_OUTPUT
+                echo "vm_ip=unknown" >> $GITHUB_OUTPUT
+                echo "firewall_rule=allow-test-services-${{ env.DEPLOYMENT_ID }}" >> $GITHUB_OUTPUT
+              else
+                echo "❌ VM not found for deployment ID: ${{ env.DEPLOYMENT_ID }}"
+                echo "   The VM may have already been deleted or the deployment ID is incorrect."
+                echo "   Available options:"
+                echo "   1. Check the deployment ID"
+                echo "   2. Use 'force_deletion' option to clean up remaining resources"
+                exit 1
+              fi
+            fi
+          fi
+      
+      - name: Stop Services Gracefully
+        continue-on-error: true
+        if: steps.vm-info.outputs.vm_name != 'not-found'
+        run: |
+          VM_NAME="${{ steps.vm-info.outputs.vm_name }}"
+          VM_ZONE="${{ steps.vm-info.outputs.vm_zone }}"
+          
+          echo "🛑 Attempting to stop services gracefully..."
+          
+          # Try to stop Docker services
+          gcloud compute ssh "$VM_NAME" --zone="$VM_ZONE" \
+            --command="
+              echo 'Stopping Docker services...'
+              cd /opt/test-services 2>/dev/null || cd /home/\$USER
+              sudo docker-compose down --timeout 30 2>/dev/null || echo 'Docker compose not available'
+              sudo docker stop \$(sudo docker ps -q) 2>/dev/null || echo 'No running containers'
+              echo 'Services stopped'
+            " \
+            --ssh-flag="-o ConnectTimeout=30" || echo "Could not connect to VM or services already stopped"
+      
+      - name: Delete VM
+        continue-on-error: true
+        if: steps.vm-info.outputs.vm_name != 'not-found'
+        run: |
+          VM_NAME="${{ steps.vm-info.outputs.vm_name }}"
+          VM_ZONE="${{ steps.vm-info.outputs.vm_zone }}"
+          
+          echo "🗑️ Deleting VM: $VM_NAME in zone $VM_ZONE"
+          
+          if gcloud compute instances delete "$VM_NAME" \
+            --zone="$VM_ZONE" \
+            --quiet; then
+            echo "✅ VM deleted successfully"
+          else
+            echo "⚠️ VM deletion failed or VM not found"
+            if [[ "${{ github.event.inputs.force_deletion }}" != "true" ]]; then
+              exit 1
+            fi
+          fi
+      
+      - name: Delete Firewall Rules
+        continue-on-error: true
+        run: |
+          FIREWALL_RULE="${{ steps.vm-info.outputs.firewall_rule }}"
+          
+          if [[ -n "$FIREWALL_RULE" && "$FIREWALL_RULE" != "null" ]]; then
+            echo "🔥 Deleting firewall rule: $FIREWALL_RULE"
+            gcloud compute firewall-rules delete "$FIREWALL_RULE" --quiet || echo "Firewall rule not found or already deleted"
+          else
+            echo "🔥 Attempting to delete firewall rule with deployment ID pattern..."
+            gcloud compute firewall-rules delete "allow-test-services-${{ env.DEPLOYMENT_ID }}" --quiet || echo "Firewall rule not found"
+          fi
+      
+      - name: Cleanup Any Remaining Resources
+        continue-on-error: true
+        run: |
+          echo "🧹 Searching for any remaining resources with deployment ID: ${{ env.DEPLOYMENT_ID }}"
+          
+          # Look for any VMs with this deployment ID
+          REMAINING_VMS=$(gcloud compute instances list \
+            --filter="labels.deployment-id=${{ env.DEPLOYMENT_ID }}" \
+            --format="value(name,zone)" || echo "")
+          
+          if [[ -n "$REMAINING_VMS" ]]; then
+            echo "🗑️ Found remaining VMs to delete:"
+            echo "$REMAINING_VMS" | while IFS=' ' read -r vm_name zone_path; do
+              if [[ -n "$vm_name" && -n "$zone_path" ]]; then
+                zone=$(basename "$zone_path")
+                echo "   Deleting VM: $vm_name in zone $zone"
+                gcloud compute instances delete "$vm_name" --zone="$zone" --quiet || echo "Failed to delete $vm_name"
+              fi
+            done
+          else
+            echo "✅ No remaining VMs found"
+          fi
+          
+          # Look for any disks with this deployment ID
+          REMAINING_DISKS=$(gcloud compute disks list \
+            --filter="labels.deployment-id=${{ env.DEPLOYMENT_ID }}" \
+            --format="value(name,zone)" || echo "")
+          
+          if [[ -n "$REMAINING_DISKS" ]]; then
+            echo "💾 Found remaining disks to delete:"
+            echo "$REMAINING_DISKS" | while IFS=' ' read -r disk_name zone_path; do
+              if [[ -n "$disk_name" && -n "$zone_path" ]]; then
+                zone=$(basename "$zone_path")
+                echo "   Deleting disk: $disk_name in zone $zone"
+                gcloud compute disks delete "$disk_name" --zone="$zone" --quiet || echo "Failed to delete $disk_name"
+              fi
+            done
+          else
+            echo "✅ No remaining disks found"
+          fi
+      
+      - name: Generate Deletion Report
+        run: |
+          VM_NAME="${{ steps.vm-info.outputs.vm_name }}"
+          VM_ZONE="${{ steps.vm-info.outputs.vm_zone }}"
+          VM_REGION="${{ steps.vm-info.outputs.vm_region }}"
+          VM_IP="${{ steps.vm-info.outputs.vm_ip }}"
+          
+          cat > deletion-report.json << EOF
+          {
+            "deletion_completed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "deployment_id": "${{ env.DEPLOYMENT_ID }}",
+            "vm_info": {
+              "name": "$VM_NAME",
+              "zone": "$VM_ZONE", 
+              "region": "$VM_REGION",
+              "ip": "$VM_IP"
+            },
+            "metadata_found": ${{ steps.vm-info.outputs.metadata_found }},
+            "deletion_method": "${{ github.event.inputs.force_deletion == 'true' && 'forced' || 'normal' }}",
+            "deleted_by": "${{ github.actor }}",
+            "deletion_workflow": {
+              "run_id": "${{ github.run_id }}",
+              "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            },
+            "status": "completed"
+          }
+          EOF
+          
+          echo ""
+          echo "🎉 VM DELETION COMPLETED!"
+          echo "========================="
+          echo "🖥️  VM Name: $VM_NAME"
+          echo "🌍 Region: $VM_REGION"
+          echo "📍 Zone: $VM_ZONE"
+          echo "🔗 IP: $VM_IP"
+          echo "👤 Deleted by: ${{ github.actor }}"
+          echo "📅 Deleted at: $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)"
+          echo "🆔 Deployment ID: ${{ env.DEPLOYMENT_ID }}"
+          echo "✅ Status: Successfully deleted"
+          echo "========================="
+      
+      - name: Upload Deletion Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: deletion-report-${{ env.DEPLOYMENT_ID }}
+          path: deletion-report.json
+          retention-days: 90

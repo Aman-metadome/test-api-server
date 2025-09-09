@@ -1,0 +1,671 @@
+name: Deploy Regional Test VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      # Infrastructure Configuration
+      region:
+        type: string
+        description: 'GCP Region (e.g., us-central1, europe-west1, asia-south1)'
+        required: true
+      zone:
+        type: string  
+        description: 'GCP Zone (e.g., us-central1-a, europe-west1-b)'
+        required: true
+      machine_type:
+        type: choice
+        description: 'VM Machine Type'
+        options:
+          - 'e2-micro'
+          - 'e2-small' 
+          - 'e2-medium'
+          - 'e2-standard-2'
+          - 'e2-standard-4'
+          - 'n1-standard-1'
+          - 'n1-standard-2'
+        default: 'e2-medium'
+      disk_size:
+        type: choice
+        description: 'Boot Disk Size (GB)'
+        options:
+          - '20'
+          - '30'
+          - '50'
+          - '100'
+        default: '30'
+      
+      # Test Configuration
+      test_language:
+        type: choice
+        description: 'Test Language'
+        options:
+          - 'english'
+          - 'arabic'
+        default: 'english'
+      test_channel:
+        type: choice
+        description: 'Test Channel'
+        options:
+          - 'whatsapp'
+          - 'web'
+        default: 'whatsapp'
+      
+      # Repository Configuration
+      test_runner_branch:
+        type: string
+        description: 'Test Runner Branch'
+        default: 'dev'
+      api_server_branch:
+        type: string
+        description: 'API Server Branch'  
+        default: 'dev'
+      
+      # External Service URLs
+      router_service_url:
+        type: string
+        description: 'Router Service URL'
+        required: true
+      webbot_ws_url:
+        type: string
+        description: 'WebBot WebSocket URL'
+        required: false
+        default: ''
+      
+      # WhatsApp Configuration
+      whatsapp_business_account_id:
+        type: string
+        description: 'WhatsApp Business Account ID'
+        required: true
+      whatsapp_phone_number_id:
+        type: string
+        description: 'WhatsApp Phone Number ID'
+        required: true
+      whatsapp_from_phone:
+        type: string
+        description: 'WhatsApp From Phone (with country code)'
+        required: true
+      whatsapp_display_phone:
+        type: string
+        description: 'WhatsApp Display Phone'
+        required: true
+      whatsapp_sender_name:
+        type: string
+        description: 'WhatsApp Sender Name'
+        default: 'Test Harness'
+      
+      # Database Configuration
+      mongodb_uri:
+        type: string
+        description: 'MongoDB Connection URI'
+        required: true
+      
+      # VM Configuration
+      vm_name_suffix:
+        type: string
+        description: 'VM Name Suffix (optional)'
+        required: false
+        default: ''
+      auto_cleanup_hours:
+        type: choice
+        description: 'Auto Cleanup (hours)'
+        options:
+          - '1'
+          - '2' 
+          - '4'
+          - '8'
+          - '12'
+          - '24'
+          - '48'
+        default: '4'
+      
+      # Network Configuration
+      network:
+        type: string
+        description: 'VPC Network'
+        default: 'default'
+      subnet:
+        type: string
+        description: 'Subnet (leave empty for auto)'
+        required: false
+        default: ''
+
+jobs:
+  deploy-vm:
+    runs-on: ubuntu-latest
+    environment: main
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    env:
+      PROJECT_ID: "vsa-ai-prod"
+      REGION: ${{ github.event.inputs.region }}
+      ZONE: ${{ github.event.inputs.zone }}
+      VM_NAME_BASE: "test-vm"
+      DEPLOYMENT_ID: ${{ github.run_id }}
+      TIMESTAMP: ${{ github.run_id }}
+    
+    outputs:
+      VM_NAME: ${{ steps.create-vm.outputs.vm_name }}
+      VM_IP: ${{ steps.get-vm-ip.outputs.ip }}
+      VM_ZONE: ${{ env.ZONE }}
+      VM_REGION: ${{ env.REGION }}
+      DEPLOYMENT_ID: ${{ env.DEPLOYMENT_ID }}
+      SERVICES_READY: ${{ steps.health-check.outputs.ready }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_VSA_PROD }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Generate VM Name
+        id: vm-name
+        run: |
+          SUFFIX="${{ github.event.inputs.vm_name_suffix }}"
+          if [[ -z "$SUFFIX" ]]; then
+            SUFFIX="$(date +%m%d%H%M)"
+          fi
+          
+          VM_NAME="${{ env.VM_NAME_BASE }}-${{ env.REGION }}-${SUFFIX}-${{ env.TIMESTAMP }}"
+          echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
+          echo "🏷️ Generated VM Name: $VM_NAME"
+      
+      - name: Validate Region and Zone
+        run: |
+          echo "🌍 Validating region and zone availability..."
+          
+          # Check if region exists
+          if ! gcloud compute regions list --format="value(name)" | grep -q "^${{ env.REGION }}$"; then
+            echo "❌ Invalid region: ${{ env.REGION }}"
+            echo "Available regions:"
+            gcloud compute regions list --format="table(name,status)"
+            exit 1
+          fi
+          
+          # Check if zone exists
+          if ! gcloud compute zones list --format="value(name)" | grep -q "^${{ env.ZONE }}$"; then
+            echo "❌ Invalid zone: ${{ env.ZONE }}"
+            echo "Available zones in ${{ env.REGION }}:"
+            gcloud compute zones list --filter="region:${{ env.REGION }}" --format="table(name,status)"
+            exit 1
+          fi
+          
+          echo "✅ Region ${{ env.REGION }} and zone ${{ env.ZONE }} are valid"
+      
+      - name: Create Network Resources
+        run: |
+          echo "🌐 Setting up network resources..."
+          
+          # Create firewall rule for this deployment
+          FIREWALL_NAME="allow-test-services-${{ env.DEPLOYMENT_ID }}"
+          
+          gcloud compute firewall-rules create $FIREWALL_NAME \
+            --allow tcp:5000,tcp:8080,tcp:22 \
+            --source-ranges 0.0.0.0/0 \
+            --description "Test services for deployment ${{ env.DEPLOYMENT_ID }}" \
+            --target-tags test-vm-${{ env.DEPLOYMENT_ID }} || echo "Firewall rule creation failed or already exists"
+      
+      - name: Create VM
+        id: create-vm
+        run: |
+          VM_NAME="${{ steps.vm-name.outputs.vm_name }}"
+          
+          # Determine subnet parameter
+          SUBNET_PARAM=""
+          if [[ -n "${{ github.event.inputs.subnet }}" ]]; then
+            SUBNET_PARAM="--subnet=${{ github.event.inputs.subnet }}"
+          fi
+          
+          echo "🖥️ Creating VM: $VM_NAME"
+          echo "   Region: ${{ env.REGION }}"
+          echo "   Zone: ${{ env.ZONE }}"
+          echo "   Machine Type: ${{ github.event.inputs.machine_type }}"
+          echo "   Disk Size: ${{ github.event.inputs.disk_size }}GB"
+          
+          gcloud compute instances create $VM_NAME \
+            --zone=${{ env.ZONE }} \
+            --machine-type=${{ github.event.inputs.machine_type }} \
+            --network-interface=network-tier=PREMIUM,network=${{ github.event.inputs.network }}${SUBNET_PARAM} \
+            --metadata-from-file startup-script=scripts/setup-vm.sh \
+            --metadata="deployment-id=${{ env.DEPLOYMENT_ID }},region=${{ env.REGION }},auto-cleanup-hours=${{ github.event.inputs.auto_cleanup_hours }}" \
+            --maintenance-policy=MIGRATE \
+            --provisioning-model=STANDARD \
+            --tags=test-vm-${{ env.DEPLOYMENT_ID }} \
+            --create-disk=auto-delete=yes,boot=yes,device-name=$VM_NAME,image=projects/debian-cloud/global/images/debian-12-bookworm-v20240213,mode=rw,size=${{ github.event.inputs.disk_size }},type=projects/${{ env.PROJECT_ID }}/zones/${{ env.ZONE }}/diskTypes/pd-balanced \
+            --no-shielded-secure-boot \
+            --shielded-vtpm \
+            --shielded-integrity-monitoring \
+            --labels=purpose=testing,deployment-id=${{ env.DEPLOYMENT_ID }},region=${{ env.REGION }},auto-delete=true,created-by=github-actions \
+            --reservation-affinity=any
+          
+          echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
+          echo "✅ VM $VM_NAME created successfully"
+      
+      - name: Wait for VM to be Ready
+        run: |
+          VM_NAME="${{ steps.create-vm.outputs.vm_name }}"
+          
+          echo "⏳ Waiting for VM startup script to complete..."
+          sleep 90  # Allow time for startup script
+          
+          # Wait for SSH to be available
+          echo "🔌 Testing SSH connectivity..."
+          for i in {1..20}; do
+            if gcloud compute ssh $VM_NAME --zone=${{ env.ZONE }} --command="echo 'SSH ready'" --quiet --ssh-flag="-o ConnectTimeout=10"; then
+              echo "✅ SSH is ready"
+              break
+            fi
+            echo "   SSH attempt $i/20..."
+            sleep 15
+          done
+          
+          # Verify startup script completion
+          echo "🔍 Checking startup script status..."
+          gcloud compute ssh $VM_NAME --zone=${{ env.ZONE }} --command="
+            sudo tail -10 /var/log/startup.log || echo 'Startup log not available'
+            echo 'Docker status:'
+            sudo systemctl is-active docker || echo 'Docker not ready'
+          "
+      
+      - name: Get VM External IP
+        id: get-vm-ip
+        run: |
+          VM_NAME="${{ steps.create-vm.outputs.vm_name }}"
+          
+          VM_IP=$(gcloud compute instances describe $VM_NAME \
+            --zone=${{ env.ZONE }} \
+            --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
+          
+          if [[ -z "$VM_IP" ]]; then
+            echo "❌ Could not get VM external IP"
+            exit 1
+          fi
+          
+          echo "ip=$VM_IP" >> $GITHUB_OUTPUT
+          echo "🌐 VM External IP: $VM_IP"
+      
+      - name: Checkout Test Runner Repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'metadome-ai/metadome-vsa-test-runner'
+          token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          path: './test-runner'
+          ref: ${{ github.event.inputs.test_runner_branch }}
+      
+      - name: Checkout API Server Repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'metadome-ai/metadome-vsa-test-api-server'
+          token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          path: './api-server'
+          ref: ${{ github.event.inputs.api_server_branch }}
+      
+      - name: Generate Dynamic Configuration
+        run: |
+          VM_IP="${{ steps.get-vm-ip.outputs.ip }}"
+          VM_NAME="${{ steps.create-vm.outputs.vm_name }}"
+          
+          echo "⚙️ Generating dynamic configuration files..."
+          
+          # Create configuration directory
+          mkdir -p ./generated-configs
+          
+          # Generate Test Runner .env
+          cat > ./generated-configs/test-runner.env << EOF
+          # Test Runner Configuration - Generated for ${{ env.REGION }}
+          API_BASE_URL=http://${VM_IP}:8080
+          DEFAULT_CHANNEL=${{ github.event.inputs.test_channel }}
+          
+          # Webhook Configuration
+          WEBHOOK_HOST=0.0.0.0
+          WEBHOOK_PORT=5000
+          WEBHOOK_ENDPOINT=/receive-response
+          
+          # Timeout Settings
+          RESPONSE_TIMEOUT=30
+          WEBHOOK_CHECK_INTERVAL=0.5
+          
+          # Database Configuration
+          MONGODB_URI=${{ github.event.inputs.mongodb_uri }}
+          
+          # Regional Information
+          REGION=${{ env.REGION }}
+          ZONE=${{ env.ZONE }}
+          VM_ID=$VM_NAME
+          DEPLOYMENT_ID=${{ env.DEPLOYMENT_ID }}
+          
+          # Test Configuration
+          TEST_LANGUAGE=${{ github.event.inputs.test_language }}
+          TEST_SCENARIOS_DIR=test_scenarios/${{ github.event.inputs.test_language }}
+          EOF
+          
+          # Generate API Server .env
+          cat > ./generated-configs/api-server.env << EOF
+          # API Server Configuration - Generated for ${{ env.REGION }}
+          PORT=8080
+          ENV=testing
+          LOG_LEVEL=info
+          LOG_FORMAT=json
+          
+          # External Service URLs
+          ROUTER_SERVICE_URL=${{ github.event.inputs.router_service_url }}
+          WEBBOT_WS_URL=${{ github.event.inputs.webbot_ws_url }}
+          
+          # Callback Configuration
+          CALLBACK_URL=http://${VM_IP}:5000/api/v1/webhook/test-results
+          TEST_MESSAGE_WEBHOOK_URL=/api/v1/messages
+          
+          # WhatsApp Configuration
+          DEFAULT_WHATSAPP_BUSINESS_ACCOUNT_ID=${{ github.event.inputs.whatsapp_business_account_id }}
+          DEFAULT_WHATSAPP_PHONE_NUMBER_ID=${{ github.event.inputs.whatsapp_phone_number_id }}
+          DEFAULT_WHATSAPP_FROM_PHONE=${{ github.event.inputs.whatsapp_from_phone }}
+          DEFAULT_WHATSAPP_DISPLAY_PHONE=${{ github.event.inputs.whatsapp_display_phone }}
+          DEFAULT_WHATSAPP_SENDER_NAME=${{ github.event.inputs.whatsapp_sender_name }}
+          
+          # Database Configuration
+          MONGODB_URI=${{ github.event.inputs.mongodb_uri }}
+          
+          # Regional Information
+          REGION=${{ env.REGION }}
+          ZONE=${{ env.ZONE }}
+          VM_ID=$VM_NAME
+          DEPLOYMENT_ID=${{ env.DEPLOYMENT_ID }}
+          
+          # Redis Configuration (Optional)
+          REDIS_ADDR=
+          REDIS_PASSWORD=
+          EOF
+          
+          # Generate Docker Compose configuration
+          cat > ./generated-configs/docker-compose.yml << EOF
+          version: '3.8'
+          
+          services:
+            test-runner:
+              build: 
+                context: ./test-runner
+                dockerfile: ../docker/test-runner/Dockerfile
+              container_name: test-runner-${{ env.DEPLOYMENT_ID }}
+              ports:
+                - "5000:5000"
+              env_file:
+                - ./test-runner.env
+              volumes:
+                - ./test-runner:/app
+                - test-logs:/app/logs
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+                interval: 30s
+                timeout: 10s
+                retries: 5
+                start_period: 60s
+              networks:
+                - test-network
+                
+            api-server:
+              build: 
+                context: ./api-server
+                dockerfile: ../docker/api-server/Dockerfile
+              container_name: api-server-${{ env.DEPLOYMENT_ID }}
+              ports:
+                - "8080:8080"
+              env_file:
+                - ./api-server.env
+              volumes:
+                - ./api-server:/app
+                - api-logs:/app/logs
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+                interval: 30s
+                timeout: 10s
+                retries: 5
+                start_period: 60s
+              depends_on:
+                test-runner:
+                  condition: service_healthy
+              networks:
+                - test-network
+          
+          volumes:
+            test-logs:
+              driver: local
+            api-logs:
+              driver: local
+          
+          networks:
+            test-network:
+              driver: bridge
+          EOF
+          
+          echo "✅ Configuration files generated"
+      
+      - name: Deploy Services to VM
+        run: |
+          VM_NAME="${{ steps.create-vm.outputs.vm_name }}"
+          
+          echo "📦 Deploying services to VM..."
+          
+          # Create remote directories
+          gcloud compute ssh $VM_NAME --zone=${{ env.ZONE }} --command="
+            sudo mkdir -p /opt/test-services/{configs,logs}
+            sudo chown -R \$USER:\$USER /opt/test-services
+          "
+          
+          # Copy application code
+          echo "📂 Copying application code..."
+          gcloud compute scp --recurse \
+            ./test-runner ./api-server \
+            $VM_NAME:/opt/test-services/ \
+            --zone=${{ env.ZONE }}
+          
+          # Copy Docker files
+          echo "🐳 Copying Docker configurations..."
+          gcloud compute scp --recurse \
+            ./docker \
+            $VM_NAME:/opt/test-services/ \
+            --zone=${{ env.ZONE }}
+          
+          # Copy generated configurations
+          echo "⚙️ Copying configuration files..."
+          gcloud compute scp --recurse \
+            ./generated-configs/* \
+            $VM_NAME:/opt/test-services/configs/ \
+            --zone=${{ env.ZONE }}
+          
+          # Copy deployment script
+          echo "📜 Copying deployment script..."
+          gcloud compute scp \
+            ./scripts/deploy-services.sh \
+            $VM_NAME:/opt/test-services/ \
+            --zone=${{ env.ZONE }}
+      
+      - name: Build and Start Services
+        run: |
+          VM_NAME="${{ steps.create-vm.outputs.vm_name }}"
+          
+          echo "🔨 Building and starting services..."
+          
+          gcloud compute ssh $VM_NAME --zone=${{ env.ZONE }} --command="
+            cd /opt/test-services
+            chmod +x deploy-services.sh
+            ./deploy-services.sh
+          "
+      
+      - name: Health Check Services
+        id: health-check
+        run: |
+          VM_IP="${{ steps.get-vm-ip.outputs.ip }}"
+          
+          echo "🏥 Performing health checks..."
+          sleep 45  # Allow services to start
+          
+          # Check API Server
+          API_READY=false
+          for i in {1..15}; do
+            if curl -f -s --connect-timeout 10 "http://${VM_IP}:8080/health" > /dev/null 2>&1; then
+              echo "✅ API Server is healthy"
+              API_READY=true
+              break
+            fi
+            echo "   API Server health check $i/15..."
+            sleep 10
+          done
+          
+          # Check Test Runner
+          RUNNER_READY=false  
+          for i in {1..15}; do
+            if curl -f -s --connect-timeout 10 "http://${VM_IP}:5000/health" > /dev/null 2>&1; then
+              echo "✅ Test Runner is healthy"
+              RUNNER_READY=true
+              break
+            fi
+            echo "   Test Runner health check $i/15..."
+            sleep 10
+          done
+          
+          SERVICES_READY="false"
+          if [[ "$API_READY" == "true" && "$RUNNER_READY" == "true" ]]; then
+            SERVICES_READY="true"
+            echo "✅ All services are healthy and ready"
+          else
+            echo "⚠️ Some services failed health checks"
+          fi
+          
+          echo "ready=$SERVICES_READY" >> $GITHUB_OUTPUT
+      
+      - name: Generate VM Metadata
+        run: |
+          VM_IP="${{ steps.get-vm-ip.outputs.ip }}"
+          VM_NAME="${{ steps.create-vm.outputs.vm_name }}"
+          
+          # Calculate cleanup timestamp
+          CLEANUP_TIMESTAMP=$(date -u -d "+${{ github.event.inputs.auto_cleanup_hours }} hours" +%Y-%m-%dT%H:%M:%SZ)
+          
+          cat > vm-metadata.json << EOF
+          {
+            "deployment": {
+              "id": "${{ env.DEPLOYMENT_ID }}",
+              "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "region": "${{ env.REGION }}",
+              "zone": "${{ env.ZONE }}",
+              "auto_cleanup_hours": "${{ github.event.inputs.auto_cleanup_hours }}",
+              "cleanup_after": "$CLEANUP_TIMESTAMP"
+            },
+            "vm": {
+              "name": "$VM_NAME",
+              "external_ip": "$VM_IP",
+              "machine_type": "${{ github.event.inputs.machine_type }}",
+              "disk_size_gb": "${{ github.event.inputs.disk_size }}",
+              "network": "${{ github.event.inputs.network }}",
+              "subnet": "${{ github.event.inputs.subnet }}",
+              "tags": ["test-vm-${{ env.DEPLOYMENT_ID }}"],
+              "firewall_rule": "allow-test-services-${{ env.DEPLOYMENT_ID }}"
+            },
+            "services": {
+              "test_runner": {
+                "url": "http://$VM_IP:5000",
+                "health_endpoint": "http://$VM_IP:5000/health",
+                "language": "${{ github.event.inputs.test_language }}",
+                "channel": "${{ github.event.inputs.test_channel }}",
+                "branch": "${{ github.event.inputs.test_runner_branch }}",
+                "ready": ${{ steps.health-check.outputs.ready }}
+              },
+              "api_server": {
+                "url": "http://$VM_IP:8080",
+                "health_endpoint": "http://$VM_IP:8080/health",
+                "branch": "${{ github.event.inputs.api_server_branch }}",
+                "ready": ${{ steps.health-check.outputs.ready }}
+              }
+            },
+            "configuration": {
+              "router_service_url": "${{ github.event.inputs.router_service_url }}",
+              "webbot_ws_url": "${{ github.event.inputs.webbot_ws_url }}",
+              "mongodb_uri": "***",
+              "whatsapp": {
+                "business_account_id": "${{ github.event.inputs.whatsapp_business_account_id }}",
+                "phone_number_id": "${{ github.event.inputs.whatsapp_phone_number_id }}",
+                "from_phone": "${{ github.event.inputs.whatsapp_from_phone }}",
+                "display_phone": "${{ github.event.inputs.whatsapp_display_phone }}",
+                "sender_name": "${{ github.event.inputs.whatsapp_sender_name }}"
+              }
+            },
+            "github": {
+              "workflow_run_id": "${{ github.run_id }}",
+              "workflow_run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "actor": "${{ github.actor }}",
+              "repository": "${{ github.repository }}",
+              "ref": "${{ github.ref }}"
+            },
+            "api_endpoints": {
+              "test_execution": "POST http://$VM_IP:5000/api/v1/tests",
+              "test_status": "GET http://$VM_IP:5000/api/v1/tests/{test_id}",
+              "direct_message": "POST http://$VM_IP:5000/api/v1/messages",
+              "webhook_callback": "POST http://$VM_IP:5000/api/v1/webhook/test-results",
+              "api_server_status": "GET http://$VM_IP:8080/health",
+              "test_runner_status": "GET http://$VM_IP:5000/health"
+            }
+          }
+          EOF
+      
+      - name: Upload VM Metadata as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-metadata-${{ env.DEPLOYMENT_ID }}
+          path: vm-metadata.json
+          retention-days: 30
+      
+      - name: Display Deployment Summary
+        run: |
+          VM_IP="${{ steps.get-vm-ip.outputs.ip }}"
+          VM_NAME="${{ steps.create-vm.outputs.vm_name }}"
+          
+          echo ""
+          echo "🎉 DEPLOYMENT COMPLETED SUCCESSFULLY!"
+          echo "=============================================="
+          echo ""
+          echo "🖥️  INFRASTRUCTURE:"
+          echo "   VM Name: $VM_NAME"
+          echo "   Region: ${{ env.REGION }}"
+          echo "   Zone: ${{ env.ZONE }}"
+          echo "   Machine Type: ${{ github.event.inputs.machine_type }}"
+          echo "   External IP: $VM_IP"
+          echo "   Disk Size: ${{ github.event.inputs.disk_size }}GB"
+          echo ""
+          echo "🚀 SERVICES:"
+          echo "   📡 Test Runner: http://$VM_IP:5000 (Status: ${{ steps.health-check.outputs.ready }})"
+          echo "   🔧 API Server: http://$VM_IP:8080 (Status: ${{ steps.health-check.outputs.ready }})"
+          echo ""
+          echo "🧪 TEST CONFIGURATION:"
+          echo "   Language: ${{ github.event.inputs.test_language }}"
+          echo "   Channel: ${{ github.event.inputs.test_channel }}"
+          echo "   Test Runner Branch: ${{ github.event.inputs.test_runner_branch }}"
+          echo "   API Server Branch: ${{ github.event.inputs.api_server_branch }}"
+          echo ""
+          echo "🌐 EXTERNAL INTEGRATIONS:"
+          echo "   Router Service: ${{ github.event.inputs.router_service_url }}"
+          echo "   WebBot WS: ${{ github.event.inputs.webbot_ws_url }}"
+          echo "   MongoDB: Connected"
+          echo ""
+          echo "🗑️  CLEANUP:"
+          echo "   Auto-cleanup: ${{ github.event.inputs.auto_cleanup_hours }} hours"
+          echo "   Deployment ID: ${{ env.DEPLOYMENT_ID }}"
+          echo ""
+          echo "📋 API ENDPOINTS FOR TESTING:"
+          echo "   POST http://$VM_IP:5000/api/v1/tests"
+          echo "   GET  http://$VM_IP:5000/api/v1/tests/{test_id}"
+          echo "   POST http://$VM_IP:5000/api/v1/messages"
+          echo "   GET  http://$VM_IP:8080/health"
+          echo "   GET  http://$VM_IP:5000/health"
+          echo ""
+          echo "🔗 Use the VM metadata artifact for cleanup operations"
+          echo "=============================================="

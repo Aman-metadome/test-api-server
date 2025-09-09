@@ -1,0 +1,50 @@
+# API Server specific Docker Compose - For local development
+version: '3.8'
+
+services:
+  api-server:
+    build:
+      context: ../../api-server
+      dockerfile: ../docker/api-server/Dockerfile
+    container_name: api-server-dev
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      - PORT=${PORT:-8080}
+      - ENV=${ENV:-development}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - ROUTER_SERVICE_URL=${ROUTER_SERVICE_URL}
+      - CALLBACK_URL=${CALLBACK_URL}
+      - WEBBOT_WS_URL=${WEBBOT_WS_URL}
+      - MONGODB_URI=${MONGODB_URI}
+      - REGION=${REGION:-unknown}
+      - VM_ID=${VM_ID:-local-dev}
+      # WhatsApp Configuration
+      - DEFAULT_WHATSAPP_BUSINESS_ACCOUNT_ID=${DEFAULT_WHATSAPP_BUSINESS_ACCOUNT_ID}
+      - DEFAULT_WHATSAPP_PHONE_NUMBER_ID=${DEFAULT_WHATSAPP_PHONE_NUMBER_ID}
+      - DEFAULT_WHATSAPP_FROM_PHONE=${DEFAULT_WHATSAPP_FROM_PHONE}
+      - DEFAULT_WHATSAPP_DISPLAY_PHONE=${DEFAULT_WHATSAPP_DISPLAY_PHONE}
+      - DEFAULT_WHATSAPP_SENDER_NAME=${DEFAULT_WHATSAPP_SENDER_NAME:-Test Harness}
+    volumes:
+      - ../../api-server:/app:ro
+      - api-server-logs:/app/logs
+      - api-server-data:/app/data
+    restart: unless-stopped
+    networks:
+      - test-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  api-server-logs:
+    driver: local
+  api-server-data:
+    driver: local
+
+networks:
+  test-network:
+    driver: bridge

@@ -1,0 +1,42 @@
+# Test Runner specific Docker Compose - For local development
+version: '3.8'
+
+services:
+  test-runner:
+    build:
+      context: ../../test-runner
+      dockerfile: ../docker/test-runner/Dockerfile
+    container_name: test-runner-dev
+    ports:
+      - "${WEBHOOK_PORT:-5000}:5000"
+    environment:
+      - API_BASE_URL=${API_BASE_URL:-http://localhost:8080}
+      - WEBHOOK_HOST=${WEBHOOK_HOST:-0.0.0.0}
+      - WEBHOOK_PORT=${WEBHOOK_PORT:-5000}
+      - MONGODB_URI=${MONGODB_URI}
+      - REGION=${REGION:-unknown}
+      - VM_ID=${VM_ID:-local-dev}
+      - DEFAULT_CHANNEL=${DEFAULT_CHANNEL:-whatsapp}
+    volumes:
+      - ../../test-runner:/app:ro
+      - test-runner-logs:/app/logs
+      - test-runner-data:/app/data
+    restart: unless-stopped
+    networks:
+      - test-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  test-runner-logs:
+    driver: local
+  test-runner-data:
+    driver: local
+
+networks:
+  test-network:
+    driver: bridge
