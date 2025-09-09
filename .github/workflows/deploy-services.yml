@@ -45,26 +45,10 @@ on:
         type: string
         description: 'MongoDB Connection URI'
         required: true
-      whatsapp_business_account_id:
+      whatsapp_config:
         type: string
-        description: 'WhatsApp Business Account ID'
+        description: 'WhatsApp Config JSON (business_account_id,phone_number_id,from_phone,display_phone,sender_name)'
         required: true
-      whatsapp_phone_number_id:
-        type: string
-        description: 'WhatsApp Phone Number ID'
-        required: true
-      whatsapp_from_phone:
-        type: string
-        description: 'WhatsApp From Phone'
-        required: true
-      whatsapp_display_phone:
-        type: string
-        description: 'WhatsApp Display Phone'
-        required: true
-      whatsapp_sender_name:
-        type: string
-        description: 'WhatsApp Sender Name'
-        default: 'Test Harness'
 
 jobs:
   deploy-services:
@@ -91,6 +75,16 @@ jobs:
       
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Parse WhatsApp Config
+        id: parse-whatsapp
+        run: |
+          WHATSAPP_JSON='${{ github.event.inputs.whatsapp_config }}'
+          echo "business_account_id=$(echo $WHATSAPP_JSON | jq -r '.business_account_id')" >> $GITHUB_OUTPUT
+          echo "phone_number_id=$(echo $WHATSAPP_JSON | jq -r '.phone_number_id')" >> $GITHUB_OUTPUT
+          echo "from_phone=$(echo $WHATSAPP_JSON | jq -r '.from_phone')" >> $GITHUB_OUTPUT
+          echo "display_phone=$(echo $WHATSAPP_JSON | jq -r '.display_phone')" >> $GITHUB_OUTPUT
+          echo "sender_name=$(echo $WHATSAPP_JSON | jq -r '.sender_name // "Test Harness"')" >> $GITHUB_OUTPUT
       
       - name: Download VM Metadata
         uses: actions/download-artifact@v4
@@ -171,11 +165,11 @@ jobs:
           ROUTER_SERVICE_URL=${{ github.event.inputs.router_service_url }}
           WEBBOT_WS_URL=${{ github.event.inputs.webbot_ws_url }}
           CALLBACK_URL=http://${VM_IP}:5000/api/v1/webhook/test-results
-          DEFAULT_WHATSAPP_BUSINESS_ACCOUNT_ID=${{ github.event.inputs.whatsapp_business_account_id }}
-          DEFAULT_WHATSAPP_PHONE_NUMBER_ID=${{ github.event.inputs.whatsapp_phone_number_id }}
-          DEFAULT_WHATSAPP_FROM_PHONE=${{ github.event.inputs.whatsapp_from_phone }}
-          DEFAULT_WHATSAPP_DISPLAY_PHONE=${{ github.event.inputs.whatsapp_display_phone }}
-          DEFAULT_WHATSAPP_SENDER_NAME=${{ github.event.inputs.whatsapp_sender_name }}
+          DEFAULT_WHATSAPP_BUSINESS_ACCOUNT_ID=${{ steps.parse-whatsapp.outputs.business_account_id }}
+          DEFAULT_WHATSAPP_PHONE_NUMBER_ID=${{ steps.parse-whatsapp.outputs.phone_number_id }}
+          DEFAULT_WHATSAPP_FROM_PHONE=${{ steps.parse-whatsapp.outputs.from_phone }}
+          DEFAULT_WHATSAPP_DISPLAY_PHONE=${{ steps.parse-whatsapp.outputs.display_phone }}
+          DEFAULT_WHATSAPP_SENDER_NAME=${{ steps.parse-whatsapp.outputs.sender_name }}
           MONGODB_URI=${{ github.event.inputs.mongodb_uri }}
           REGION=${{ steps.vm-info.outputs.vm_zone }}
           VM_ID=$VM_NAME
