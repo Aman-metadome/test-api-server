@@ -3,7 +3,6 @@ name: Create Regional Test VM
 on:
   workflow_dispatch:
     inputs:
-      # Infrastructure Configuration
       region:
         type: string
         description: 'GCP Region (e.g., us-central1, europe-west1, asia-south1)'
@@ -33,24 +32,11 @@ on:
           - '50'
           - '100'
         default: '30'
-      
-      # VM Configuration
       vm_name_suffix:
         type: string
         description: 'VM Name Suffix (optional)'
         required: false
         default: ''
-      network:
-        type: string
-        description: 'Network'
-        default: 'default'
-      subnet:
-        type: string
-        description: 'Subnet (optional)'
-        required: false
-        default: ''
-      
-      # Auto Cleanup
       auto_cleanup_hours:
         type: choice
         description: 'Auto-cleanup VM after (hours)'
@@ -77,16 +63,7 @@ jobs:
       PROJECT_ID: "vsa-ai-prod"
       REGION: ${{ github.event.inputs.region }}
       ZONE: ${{ github.event.inputs.zone }}
-      VM_NAME_BASE: "test-vm"
       DEPLOYMENT_ID: ${{ github.run_id }}
-      TIMESTAMP: ${{ github.run_id }}
-    
-    outputs:
-      VM_NAME: ${{ steps.create-vm.outputs.vm_name }}
-      VM_IP: ${{ steps.get-vm-ip.outputs.ip }}
-      VM_ZONE: ${{ env.ZONE }}
-      VM_REGION: ${{ env.REGION }}
-      DEPLOYMENT_ID: ${{ env.DEPLOYMENT_ID }}
     
     steps:
       - name: Checkout Repository
@@ -107,152 +84,58 @@ jobs:
           if [[ -z "$SUFFIX" ]]; then
             SUFFIX="$(date +%m%d%H%M)"
           fi
-          
-          VM_NAME="${{ env.VM_NAME_BASE }}-${{ env.REGION }}-${SUFFIX}-${{ env.TIMESTAMP }}"
+          VM_NAME="test-vm-${{ env.REGION }}-${SUFFIX}-${{ env.DEPLOYMENT_ID }}"
           echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
-          echo "🏷️ Generated VM Name: $VM_NAME"
-      
-      - name: Validate Region and Zone
-        run: |
-          echo "🌍 Validating region and zone availability..."
-          
-          # Check if region exists
-          if ! gcloud compute regions list --format="value(name)" | grep -q "^${{ env.REGION }}$"; then
-            echo "❌ Invalid region: ${{ env.REGION }}"
-            echo "Available regions:"
-            gcloud compute regions list --format="table(name,status)"
-            exit 1
-          fi
-          
-          # Check if zone exists
-          if ! gcloud compute zones list --format="value(name)" | grep -q "^${{ env.ZONE }}$"; then
-            echo "❌ Invalid zone: ${{ env.ZONE }}"
-            echo "Available zones for region ${{ env.REGION }}:"
-            gcloud compute zones list --filter="region:${{ env.REGION }}" --format="table(name,status)"
-            exit 1
-          fi
-          
-          echo "✅ Region and zone validated"
       
       - name: Create Firewall Rule
         run: |
           FIREWALL_RULE="allow-test-services-${{ env.DEPLOYMENT_ID }}"
-          echo "🔥 Creating firewall rule: $FIREWALL_RULE"
-          
           gcloud compute firewall-rules create "$FIREWALL_RULE" \
-            --allow tcp:5000,tcp:8080,tcp:22,tcp:80,tcp:443 \
+            --allow tcp:5000,tcp:8080,tcp:22,tcp:9999 \
             --source-ranges 0.0.0.0/0 \
-            --description "Allow test services for deployment ${{ env.DEPLOYMENT_ID }}" \
-            --target-tags "test-vm-${{ env.DEPLOYMENT_ID }}" || {
-              echo "❌ Failed to create firewall rule"
-              exit 1
-            }
-          
-          echo "✅ Firewall rule created successfully"
+            --description "Test services for deployment ${{ env.DEPLOYMENT_ID }}" \
+            --target-tags "test-vm-${{ env.DEPLOYMENT_ID }}"
       
       - name: Generate Startup Script
         run: |
           cat > startup-script.sh << 'EOF'
           #!/bin/bash
-          # VM Startup Script - Basic Setup Only
+          exec > /var/log/startup.log 2>&1
           
-          exec > >(tee -a /var/log/startup.log)
-          exec 2>&1
-          
-          echo "$(date): Starting VM basic setup..."
-          
-          # Get instance metadata
-          INSTANCE_NAME=$(curl -s -H "Metadata-Flavor: Google" \
-            http://metadata.google.internal/computeMetadata/v1/instance/name)
-          INSTANCE_ZONE=$(curl -s -H "Metadata-Flavor: Google" \
-            http://metadata.google.internal/computeMetadata/v1/instance/zone | cut -d/ -f4)
-          PROJECT_ID=$(curl -s -H "Metadata-Flavor: Google" \
-            http://metadata.google.internal/computeMetadata/v1/project/project-id)
-          
-          echo "Instance: $INSTANCE_NAME"
-          echo "Zone: $INSTANCE_ZONE"
-          echo "Project: $PROJECT_ID"
-          
-          # Update system
+          # Update and install packages
           apt-get update -y
+          apt-get install -y curl wget git jq bc docker.io docker-compose python3 python3-pip
           
-          # Install essential packages
-          apt-get install -y curl wget git unzip htop net-tools jq bc lsb-release
-          
-          # Install Docker
-          curl -fsSL https://get.docker.com -o get-docker.sh
-          sh get-docker.sh
-          rm get-docker.sh
-          
-          # Start and enable Docker
+          # Start Docker
           systemctl start docker
           systemctl enable docker
-          
-          # Add user to docker group
-          usermod -aG docker debian || true
-          
-          # Install Docker Compose
-          DOCKER_COMPOSE_VERSION="v2.24.1"
-          curl -SL "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-linux-$(uname -m)" -o /usr/local/bin/docker-compose
-          chmod +x /usr/local/bin/docker-compose
-          ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+          usermod -aG docker debian
           
           # Install Go
-          GO_VERSION="1.21.5"
-          wget "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -O /tmp/go.tar.gz
+          wget -q https://go.dev/dl/go1.21.5.linux-amd64.tar.gz -O /tmp/go.tar.gz
           tar -C /usr/local -xzf /tmp/go.tar.gz
           echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-          echo 'export PATH=$PATH:/usr/local/go/bin' >> /home/debian/.bashrc
           rm /tmp/go.tar.gz
           
-          # Install Python and pip
-          apt-get install -y python3 python3-pip python3-venv python3-dev
-          
-          # Create application directories
-          mkdir -p /opt/test-services/{configs,logs,data}
+          # Create directories
+          mkdir -p /opt/test-services/{configs,logs}
           chown -R debian:debian /opt/test-services
           
-          # Create health check script
+          # Simple health endpoint
           cat > /opt/test-services/health-check.sh << 'HEALTH_EOF'
           #!/bin/bash
-          API_SERVER_PORT=8080
-          TEST_RUNNER_PORT=5000
+          API_STATUS="down"
+          TEST_STATUS="down"
           
-          API_SERVER_STATUS="down"
-          TEST_RUNNER_STATUS="down"
-          
-          if netstat -tuln | grep -q ":${API_SERVER_PORT} "; then
-            if curl -f -s "http://localhost:${API_SERVER_PORT}/health" > /dev/null 2>&1; then
-              API_SERVER_STATUS="up"
-            fi
-          fi
-          
-          if netstat -tuln | grep -q ":${TEST_RUNNER_PORT} "; then
-            if curl -f -s "http://localhost:${TEST_RUNNER_PORT}/health" > /dev/null 2>&1; then
-              TEST_RUNNER_STATUS="up"
-            fi
-          fi
+          if curl -s http://localhost:8080/health >/dev/null 2>&1; then API_STATUS="up"; fi
+          if curl -s http://localhost:5000/health >/dev/null 2>&1; then TEST_STATUS="up"; fi
           
           cat << EOM
           {
-            "status": "healthy",
             "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "services": {
-              "api_server": {
-                "status": "$API_SERVER_STATUS",
-                "port": $API_SERVER_PORT,
-                "url": "http://$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip):$API_SERVER_PORT"
-              },
-              "test_runner": {
-                "status": "$TEST_RUNNER_STATUS", 
-                "port": $TEST_RUNNER_PORT,
-                "url": "http://$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip):$TEST_RUNNER_PORT"
-              }
-            },
-            "vm": {
-              "name": "$INSTANCE_NAME",
-              "zone": "$INSTANCE_ZONE",
-              "project": "$PROJECT_ID"
+              "api_server": "$API_STATUS",
+              "test_runner": "$TEST_STATUS"
             }
           }
           EOM
@@ -260,174 +143,64 @@ jobs:
           
           chmod +x /opt/test-services/health-check.sh
           
-          # Create simple status endpoint
-          cat > /opt/test-services/status-server.py << 'STATUS_EOF'
-          #!/usr/bin/env python3
-          import json
-          import subprocess
-          from http.server import HTTPServer, BaseHTTPRequestHandler
-          import threading
-          import time
-          
-          class StatusHandler(BaseHTTPRequestHandler):
+          # Start health endpoint
+          python3 -c "
+          import http.server, subprocess, json
+          class Handler(http.server.BaseHTTPRequestHandler):
               def do_GET(self):
                   if self.path == '/status':
-                      try:
-                          result = subprocess.run(['/opt/test-services/health-check.sh'], 
-                                                capture_output=True, text=True)
-                          self.send_response(200)
-                          self.send_header('Content-type', 'application/json')
-                          self.end_headers()
-                          self.wfile.write(result.stdout.encode())
-                      except Exception as e:
-                          self.send_response(500)
-                          self.send_header('Content-type', 'application/json')
-                          self.end_headers()
-                          response = json.dumps({"error": str(e)})
-                          self.wfile.write(response.encode())
+                      result = subprocess.run(['/opt/test-services/health-check.sh'], capture_output=True, text=True)
+                      self.send_response(200)
+                      self.send_header('Content-type', 'application/json')
+                      self.end_headers()
+                      self.wfile.write(result.stdout.encode())
                   else:
                       self.send_response(404)
                       self.end_headers()
           
-          if __name__ == '__main__':
-              server = HTTPServer(('0.0.0.0', 9999), StatusHandler)
-              print("Status server started on port 9999")
-              server.serve_forever()
-          STATUS_EOF
+          server = http.server.HTTPServer(('0.0.0.0', 9999), Handler)
+          server.serve_forever()
+          " &
           
-          chmod +x /opt/test-services/status-server.py
-          
-          # Start status server in background
-          nohup python3 /opt/test-services/status-server.py > /var/log/status-server.log 2>&1 &
-          
-          # Clean up
-          apt-get autoremove -y
-          apt-get autoclean
-          
-          # Create completion marker
-          touch /opt/test-services/vm-setup-complete
-          
-          echo "$(date): VM basic setup completed successfully!"
-          echo "VM is ready for service deployment"
-          
+          touch /opt/test-services/setup-complete
           EOF
-          
-          echo "📝 Startup script generated"
       
       - name: Create VM Instance
         id: create-vm
         run: |
           VM_NAME="${{ steps.vm-name.outputs.vm_name }}"
-          
-          echo "🚀 Creating VM: $VM_NAME"
-          
-          # Build subnet parameter if provided
-          SUBNET_PARAM=""
-          if [[ -n "${{ github.event.inputs.subnet }}" ]]; then
-            SUBNET_PARAM="--subnet=${{ github.event.inputs.subnet }}"
-          fi
-          
           gcloud compute instances create "$VM_NAME" \
             --zone="${{ env.ZONE }}" \
             --machine-type="${{ github.event.inputs.machine_type }}" \
-            --network="${{ github.event.inputs.network }}" \
-            $SUBNET_PARAM \
-            --maintenance-policy=MIGRATE \
-            --provisioning-model=STANDARD \
-            --service-account=default \
-            --scopes=https://www.googleapis.com/auth/cloud-platform \
+            --network="default" \
             --tags="test-vm-${{ env.DEPLOYMENT_ID }}" \
             --create-disk=auto-delete=yes,boot=yes,device-name="$VM_NAME",image=projects/debian-cloud/global/images/family/debian-12,mode=rw,size=${{ github.event.inputs.disk_size }},type=projects/${{ env.PROJECT_ID }}/zones/${{ env.ZONE }}/diskTypes/pd-standard \
-            --no-shielded-secure-boot \
-            --shielded-vtpm \
-            --shielded-integrity-monitoring \
-            --labels=deployment-id=${{ env.DEPLOYMENT_ID }},purpose=testing,auto-cleanup=true \
+            --labels=deployment-id=${{ env.DEPLOYMENT_ID }},purpose=testing \
             --metadata-from-file startup-script=startup-script.sh \
-            --metadata deployment-id=${{ env.DEPLOYMENT_ID }},purpose=testing,created-by=${{ github.actor }},auto-cleanup-hours=${{ github.event.inputs.auto_cleanup_hours }} || {
-              echo "❌ Failed to create VM"
-              exit 1
-            }
-          
+            --metadata deployment-id=${{ env.DEPLOYMENT_ID }},auto-cleanup-hours=${{ github.event.inputs.auto_cleanup_hours }}
           echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
-          echo "✅ VM created successfully: $VM_NAME"
       
-      - name: Wait for VM to be Ready
+      - name: Wait for VM Ready
         run: |
           VM_NAME="${{ steps.create-vm.outputs.vm_name }}"
-          echo "⏳ Waiting for VM to be running..."
-          
-          # Wait for VM to be in RUNNING state
-          for i in {1..60}; do
+          for i in {1..30}; do
             STATUS=$(gcloud compute instances describe "$VM_NAME" --zone="${{ env.ZONE }}" --format="get(status)")
-            if [[ "$STATUS" == "RUNNING" ]]; then
-              echo "✅ VM is running"
-              break
-            fi
-            echo "   VM Status: $STATUS (attempt $i/60)"
-            sleep 5
+            if [[ "$STATUS" == "RUNNING" ]]; then break; fi
+            sleep 10
           done
-          
-          # Additional wait for startup script completion
-          echo "⏳ Waiting for startup script to complete..."
-          sleep 60
+          sleep 60  # Wait for startup script
       
-      - name: Get VM External IP
+      - name: Get VM IP
         id: get-vm-ip
         run: |
           VM_NAME="${{ steps.create-vm.outputs.vm_name }}"
-          
-          echo "🔍 Getting VM external IP..."
-          VM_IP=$(gcloud compute instances describe "$VM_NAME" \
-            --zone="${{ env.ZONE }}" \
-            --format="get(networkInterfaces[0].accessConfigs[0].natIP)")
-          
-          if [[ -z "$VM_IP" ]]; then
-            echo "❌ Could not get VM external IP"
-            exit 1
-          fi
-          
+          VM_IP=$(gcloud compute instances describe "$VM_NAME" --zone="${{ env.ZONE }}" --format="get(networkInterfaces[0].accessConfigs[0].natIP)")
           echo "ip=$VM_IP" >> $GITHUB_OUTPUT
-          echo "🌐 VM External IP: $VM_IP"
-      
-      - name: Test Basic Connectivity
-        run: |
-          VM_IP="${{ steps.get-vm-ip.outputs.ip }}"
-          
-          echo "🔍 Testing basic connectivity..."
-          
-          # Test SSH connectivity
-          for i in {1..12}; do
-            if gcloud compute ssh "debian@${{ steps.create-vm.outputs.vm_name }}" \
-               --zone="${{ env.ZONE }}" \
-               --command="echo 'SSH connection successful'" \
-               --ssh-flag="-o ConnectTimeout=10"; then
-              echo "✅ SSH connectivity confirmed"
-              break
-            fi
-            echo "   SSH attempt $i/12 failed, retrying in 10s..."
-            sleep 10
-          done
-          
-          # Test status endpoint
-          sleep 30
-          echo "🔍 Testing status endpoint..."
-          for i in {1..6}; do
-            if curl -f -s "http://$VM_IP:9999/status" > /dev/null; then
-              echo "✅ Status endpoint is responding"
-              break
-            fi
-            echo "   Status endpoint test $i/6 failed, retrying in 10s..."
-            sleep 10
-          done
       
       - name: Generate VM Metadata
         run: |
           VM_IP="${{ steps.get-vm-ip.outputs.ip }}"
           VM_NAME="${{ steps.create-vm.outputs.vm_name }}"
-          
-          # Calculate cleanup timestamp
-          CLEANUP_TIMESTAMP=$(date -u -d "+${{ github.event.inputs.auto_cleanup_hours }} hours" +%Y-%m-%dT%H:%M:%SZ)
-          
           cat > vm-metadata.json << EOF
           {
             "deployment": {
@@ -435,68 +208,35 @@ jobs:
               "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
               "region": "${{ env.REGION }}",
               "zone": "${{ env.ZONE }}",
-              "auto_cleanup_hours": "${{ github.event.inputs.auto_cleanup_hours }}",
-              "cleanup_after": "$CLEANUP_TIMESTAMP"
+              "auto_cleanup_hours": "${{ github.event.inputs.auto_cleanup_hours }}"
             },
             "vm": {
               "name": "$VM_NAME",
               "external_ip": "$VM_IP",
               "machine_type": "${{ github.event.inputs.machine_type }}",
               "disk_size_gb": "${{ github.event.inputs.disk_size }}",
-              "network": "${{ github.event.inputs.network }}",
-              "subnet": "${{ github.event.inputs.subnet }}",
-              "tags": ["test-vm-${{ env.DEPLOYMENT_ID }}"],
               "firewall_rule": "allow-test-services-${{ env.DEPLOYMENT_ID }}"
             },
             "services": {
-              "status": "vm_created",
               "deployed": false,
               "status_endpoint": "http://$VM_IP:9999/status"
-            },
-            "github": {
-              "workflow_run_id": "${{ github.run_id }}",
-              "workflow_run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-              "actor": "${{ github.actor }}",
-              "repository": "${{ github.repository }}",
-              "ref": "${{ github.ref }}"
             }
           }
           EOF
       
-      - name: Upload VM Metadata as Artifact
+      - name: Upload VM Metadata
         uses: actions/upload-artifact@v4
         with:
           name: vm-metadata-${{ env.DEPLOYMENT_ID }}
           path: vm-metadata.json
           retention-days: 30
       
-      - name: Display VM Creation Summary
+      - name: Display Summary
         run: |
           VM_IP="${{ steps.get-vm-ip.outputs.ip }}"
           VM_NAME="${{ steps.create-vm.outputs.vm_name }}"
-          
-          echo ""
-          echo "🎉 VM CREATION COMPLETED SUCCESSFULLY!"
-          echo "=============================================="
-          echo ""
-          echo "🖥️  INFRASTRUCTURE:"
-          echo "   VM Name: $VM_NAME"
-          echo "   Region: ${{ env.REGION }}"
-          echo "   Zone: ${{ env.ZONE }}"
-          echo "   Machine Type: ${{ github.event.inputs.machine_type }}"
-          echo "   External IP: $VM_IP"
-          echo "   Disk Size: ${{ github.event.inputs.disk_size }}GB"
-          echo ""
-          echo "🔗 STATUS ENDPOINT:"
-          echo "   http://$VM_IP:9999/status"
-          echo ""
-          echo "🗑️  CLEANUP:"
-          echo "   Auto-cleanup: ${{ github.event.inputs.auto_cleanup_hours }} hours"
-          echo "   Deployment ID: ${{ env.DEPLOYMENT_ID }}"
-          echo ""
-          echo "📋 NEXT STEPS:"
-          echo "   1. Use 'Deploy Services' workflow to deploy test services"
-          echo "   2. Use Deployment ID: ${{ env.DEPLOYMENT_ID }} for service deployment"
-          echo "   3. Use 'Delete VM' workflow when done testing"
-          echo ""
-          echo "=============================================="
+          echo "VM Created: $VM_NAME"
+          echo "External IP: $VM_IP"
+          echo "Region: ${{ env.REGION }}"
+          echo "Deployment ID: ${{ env.DEPLOYMENT_ID }}"
+          echo "Status Endpoint: http://$VM_IP:9999/status"
