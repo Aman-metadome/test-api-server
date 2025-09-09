@@ -1,0 +1,662 @@
+name: Deploy/Redeploy Services on VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      # VM Selection
+      deployment_id:
+        type: string
+        description: 'Deployment ID (GitHub Run ID from VM creation workflow)'
+        required: true
+      
+      # Service Configuration
+      force_redeploy:
+        type: boolean
+        description: 'Force redeploy (stop existing services first)'
+        default: false
+      
+      # Test Configuration - Can be changed on redeploy
+      test_language:
+        type: choice
+        description: 'Test Language'
+        options:
+          - 'english'
+          - 'arabic'
+        default: 'english'
+      test_channel:
+        type: choice
+        description: 'Test Channel'
+        options:
+          - 'whatsapp'
+          - 'web'
+        default: 'whatsapp'
+      
+      # Repository Configuration
+      test_runner_branch:
+        type: string
+        description: 'Test Runner Branch'
+        default: 'dev'
+      api_server_branch:
+        type: string
+        description: 'API Server Branch'  
+        default: 'dev'
+      
+      # External Service URLs - Can be updated on redeploy
+      router_service_url:
+        type: string
+        description: 'Router Service URL'
+        required: true
+      webbot_ws_url:
+        type: string
+        description: 'WebBot WebSocket URL'
+        required: true
+      mongodb_uri:
+        type: string
+        description: 'MongoDB Connection URI'
+        required: true
+      
+      # WhatsApp Configuration - Can be updated
+      whatsapp_business_account_id:
+        type: string
+        description: 'WhatsApp Business Account ID'
+        required: true
+      whatsapp_phone_number_id:
+        type: string
+        description: 'WhatsApp Phone Number ID'
+        required: true
+      whatsapp_from_phone:
+        type: string
+        description: 'WhatsApp From Phone (e.g., +1234567890)'
+        required: true
+      whatsapp_display_phone:
+        type: string
+        description: 'WhatsApp Display Phone'
+        required: true
+      whatsapp_sender_name:
+        type: string
+        description: 'WhatsApp Sender Name'
+        default: 'Test Harness'
+
+jobs:
+  deploy-services:
+    runs-on: ubuntu-latest
+    environment: main
+    
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    
+    env:
+      PROJECT_ID: "vsa-ai-prod"
+      DEPLOYMENT_ID: ${{ github.event.inputs.deployment_id }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_VSA_PROD }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Download VM Metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-metadata-${{ env.DEPLOYMENT_ID }}
+          path: ./metadata
+      
+      - name: Extract VM Information
+        id: vm-info
+        run: |
+          if [[ ! -f ./metadata/vm-metadata.json ]]; then
+            echo "❌ VM metadata not found for deployment ID: ${{ env.DEPLOYMENT_ID }}"
+            echo "Please make sure the VM was created using the 'Create VM' workflow"
+            exit 1
+          fi
+          
+          echo "📋 Extracting VM information..."
+          
+          VM_NAME=$(jq -r '.vm.name' ./metadata/vm-metadata.json)
+          VM_ZONE=$(jq -r '.deployment.zone' ./metadata/vm-metadata.json)
+          VM_REGION=$(jq -r '.deployment.region' ./metadata/vm-metadata.json)
+          VM_IP=$(jq -r '.vm.external_ip' ./metadata/vm-metadata.json)
+          
+          echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
+          echo "vm_zone=$VM_ZONE" >> $GITHUB_OUTPUT
+          echo "vm_region=$VM_REGION" >> $GITHUB_OUTPUT
+          echo "vm_ip=$VM_IP" >> $GITHUB_OUTPUT
+          
+          echo "🖥️  VM Name: $VM_NAME"
+          echo "🌍 Region: $VM_REGION"
+          echo "📍 Zone: $VM_ZONE"
+          echo "🌐 IP: $VM_IP"
+      
+      - name: Verify VM is Running
+        run: |
+          VM_NAME="${{ steps.vm-info.outputs.vm_name }}"
+          VM_ZONE="${{ steps.vm-info.outputs.vm_zone }}"
+          
+          echo "🔍 Checking VM status..."
+          VM_STATUS=$(gcloud compute instances describe "$VM_NAME" --zone="$VM_ZONE" --format="get(status)")
+          
+          if [[ "$VM_STATUS" != "RUNNING" ]]; then
+            echo "❌ VM is not running. Current status: $VM_STATUS"
+            echo "Please ensure the VM is running before deploying services"
+            exit 1
+          fi
+          
+          echo "✅ VM is running"
+      
+      - name: Test VM Connectivity
+        run: |
+          VM_NAME="${{ steps.vm-info.outputs.vm_name }}"
+          VM_ZONE="${{ steps.vm-info.outputs.vm_zone }}"
+          VM_IP="${{ steps.vm-info.outputs.vm_ip }}"
+          
+          echo "🔍 Testing VM connectivity..."
+          
+          # Test SSH connectivity
+          if ! gcloud compute ssh "debian@$VM_NAME" \
+               --zone="$VM_ZONE" \
+               --command="echo 'SSH test successful'" \
+               --ssh-flag="-o ConnectTimeout=10"; then
+            echo "❌ Cannot establish SSH connection to VM"
+            exit 1
+          fi
+          
+          echo "✅ SSH connectivity confirmed"
+          
+          # Test status endpoint
+          if curl -f -s "http://$VM_IP:9999/status" > /dev/null; then
+            echo "✅ Status endpoint is responding"
+          else
+            echo "⚠️  Status endpoint not responding (VM might still be starting up)"
+          fi
+      
+      - name: Stop Existing Services (if force redeploy)
+        if: github.event.inputs.force_redeploy == 'true'
+        run: |
+          VM_NAME="${{ steps.vm-info.outputs.vm_name }}"
+          VM_ZONE="${{ steps.vm-info.outputs.vm_zone }}"
+          
+          echo "🛑 Force redeploy enabled - stopping existing services..."
+          
+          gcloud compute ssh "debian@$VM_NAME" --zone="$VM_ZONE" --command="
+            cd /opt/test-services || exit 0
+            if [ -f docker-compose.yml ]; then
+              echo 'Stopping existing services...'
+              sudo docker-compose down --timeout 30 2>/dev/null || echo 'No existing services to stop'
+              sudo docker system prune -f || echo 'System prune completed'
+            fi
+          "
+          
+          echo "✅ Existing services stopped"
+      
+      - name: Checkout Test Runner Repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'metadome-ai/metadome-vsa-test-runner'
+          token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          path: './test-runner'
+          ref: ${{ github.event.inputs.test_runner_branch }}
+      
+      - name: Checkout API Server Repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'metadome-ai/metadome-vsa-test-api-server'
+          token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          path: './api-server'
+          ref: ${{ github.event.inputs.api_server_branch }}
+      
+      - name: Generate Service Configuration
+        id: generate-config
+        run: |
+          VM_IP="${{ steps.vm-info.outputs.vm_ip }}"
+          VM_NAME="${{ steps.vm-info.outputs.vm_name }}"
+          VM_REGION="${{ steps.vm-info.outputs.vm_region }}"
+          VM_ZONE="${{ steps.vm-info.outputs.vm_zone }}"
+          
+          echo "⚙️ Generating service configuration files..."
+          
+          # Create configuration directory
+          mkdir -p ./service-configs
+          
+          # Generate Test Runner .env
+          cat > ./service-configs/test-runner.env << EOF
+          # Test Runner Configuration - Generated for $VM_REGION
+          # Deployment: ${{ env.DEPLOYMENT_ID }} | Language: ${{ github.event.inputs.test_language }} | Channel: ${{ github.event.inputs.test_channel }}
+          
+          API_BASE_URL=http://${VM_IP}:8080
+          DEFAULT_CHANNEL=${{ github.event.inputs.test_channel }}
+          
+          # Webhook Configuration
+          WEBHOOK_HOST=0.0.0.0
+          WEBHOOK_PORT=5000
+          WEBHOOK_ENDPOINT=/receive-response
+          
+          # Timeout Settings
+          RESPONSE_TIMEOUT=30
+          WEBHOOK_CHECK_INTERVAL=0.5
+          
+          # Database Configuration
+          MONGODB_URI=${{ github.event.inputs.mongodb_uri }}
+          
+          # Regional Information
+          REGION=$VM_REGION
+          ZONE=$VM_ZONE
+          VM_ID=$VM_NAME
+          DEPLOYMENT_ID=${{ env.DEPLOYMENT_ID }}
+          
+          # Test Configuration
+          TEST_LANGUAGE=${{ github.event.inputs.test_language }}
+          TEST_SCENARIOS_DIR=test_scenarios/${{ github.event.inputs.test_language }}
+          
+          # Service Information
+          SERVICE_DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          SERVICE_VERSION=${{ github.event.inputs.test_runner_branch }}
+          EOF
+          
+          # Generate API Server .env
+          cat > ./service-configs/api-server.env << EOF
+          # API Server Configuration - Generated for $VM_REGION
+          # Deployment: ${{ env.DEPLOYMENT_ID }} | Language: ${{ github.event.inputs.test_language }} | Channel: ${{ github.event.inputs.test_channel }}
+          
+          PORT=8080
+          ENV=testing
+          LOG_LEVEL=info
+          LOG_FORMAT=json
+          
+          # External Service URLs
+          ROUTER_SERVICE_URL=${{ github.event.inputs.router_service_url }}
+          WEBBOT_WS_URL=${{ github.event.inputs.webbot_ws_url }}
+          
+          # Callback Configuration
+          CALLBACK_URL=http://${VM_IP}:5000/api/v1/webhook/test-results
+          TEST_MESSAGE_WEBHOOK_URL=/api/v1/messages
+          
+          # WhatsApp Configuration
+          DEFAULT_WHATSAPP_BUSINESS_ACCOUNT_ID=${{ github.event.inputs.whatsapp_business_account_id }}
+          DEFAULT_WHATSAPP_PHONE_NUMBER_ID=${{ github.event.inputs.whatsapp_phone_number_id }}
+          DEFAULT_WHATSAPP_FROM_PHONE=${{ github.event.inputs.whatsapp_from_phone }}
+          DEFAULT_WHATSAPP_DISPLAY_PHONE=${{ github.event.inputs.whatsapp_display_phone }}
+          DEFAULT_WHATSAPP_SENDER_NAME=${{ github.event.inputs.whatsapp_sender_name }}
+          
+          # Database Configuration
+          MONGODB_URI=${{ github.event.inputs.mongodb_uri }}
+          
+          # Regional Information
+          REGION=$VM_REGION
+          ZONE=$VM_ZONE
+          VM_ID=$VM_NAME
+          DEPLOYMENT_ID=${{ env.DEPLOYMENT_ID }}
+          
+          # Service Information
+          SERVICE_DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          SERVICE_VERSION=${{ github.event.inputs.api_server_branch }}
+          
+          # Redis Configuration (Optional)
+          REDIS_ADDR=
+          REDIS_PASSWORD=
+          EOF
+          
+          # Generate Docker Compose configuration
+          cat > ./service-configs/docker-compose.yml << EOF
+          version: '3.8'
+          
+          services:
+            test-runner:
+              build: 
+                context: ./test-runner
+                dockerfile: Dockerfile
+              container_name: test-runner-${{ env.DEPLOYMENT_ID }}
+              ports:
+                - "5000:5000"
+              env_file:
+                - ./test-runner.env
+              volumes:
+                - ./test-runner:/app:ro
+                - test-runner-logs:/app/logs
+                - test-runner-data:/app/data
+              restart: unless-stopped
+              networks:
+                - test-network
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+                start_period: 60s
+              labels:
+                - "deployment.id=${{ env.DEPLOYMENT_ID }}"
+                - "service.name=test-runner"
+                - "service.language=${{ github.event.inputs.test_language }}"
+                - "service.channel=${{ github.event.inputs.test_channel }}"
+                
+            api-server:
+              build: 
+                context: ./api-server
+                dockerfile: Dockerfile
+              container_name: api-server-${{ env.DEPLOYMENT_ID }}
+              ports:
+                - "8080:8080"
+              env_file:
+                - ./api-server.env
+              volumes:
+                - ./api-server:/app:ro
+                - api-server-logs:/app/logs
+                - api-server-data:/app/data
+              restart: unless-stopped
+              networks:
+                - test-network
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+                start_period: 30s
+              labels:
+                - "deployment.id=${{ env.DEPLOYMENT_ID }}"
+                - "service.name=api-server"
+                - "service.language=${{ github.event.inputs.test_language }}"
+                - "service.channel=${{ github.event.inputs.test_channel }}"
+          
+          volumes:
+            test-runner-logs:
+              driver: local
+            test-runner-data:
+              driver: local
+            api-server-logs:
+              driver: local
+            api-server-data:
+              driver: local
+          
+          networks:
+            test-network:
+              driver: bridge
+          EOF
+          
+          # Generate deployment script
+          cat > ./service-configs/deploy-services.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          SCRIPT_DIR="/opt/test-services"
+          LOG_FILE="$SCRIPT_DIR/logs/deployment.log"
+          
+          log() {
+              echo "$(date '+%Y-%m-%d %H:%M:%S') [DEPLOY] $1" | tee -a "$LOG_FILE"
+          }
+          
+          log "Starting service deployment..."
+          
+          cd "$SCRIPT_DIR" || exit 1
+          
+          # Ensure log directory exists
+          mkdir -p logs
+          
+          # Stop existing services if running
+          log "Stopping existing services..."
+          docker-compose down --timeout 30 2>/dev/null || log "No existing services to stop"
+          
+          # Build and start services
+          log "Building services..."
+          docker-compose build --no-cache
+          
+          log "Starting services..."
+          docker-compose up -d
+          
+          # Wait for services to be ready
+          log "Waiting for services to start..."
+          sleep 45
+          
+          # Check service health
+          log "Checking service health..."
+          
+          API_HEALTH="down"
+          TEST_RUNNER_HEALTH="down"
+          
+          for i in {1..12}; do
+              if curl -f -s "http://localhost:8080/health" > /dev/null 2>&1; then
+                  API_HEALTH="up"
+                  log "API Server health check: PASSED"
+                  break
+              fi
+              log "API Server health check attempt $i/12 failed, retrying in 10s..."
+              sleep 10
+          done
+          
+          for i in {1..12}; do
+              if curl -f -s "http://localhost:5000/health" > /dev/null 2>&1; then
+                  TEST_RUNNER_HEALTH="up"
+                  log "Test Runner health check: PASSED"
+                  break
+              fi
+              log "Test Runner health check attempt $i/12 failed, retrying in 10s..."
+              sleep 10
+          done
+          
+          # Create deployment status
+          cat > "$SCRIPT_DIR/deployment-status.json" << EOM
+          {
+            "deployment_id": "$DEPLOYMENT_ID",
+            "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "status": "deployed",
+            "services": {
+              "api_server": {
+                "status": "$API_HEALTH",
+                "port": 8080,
+                "health_endpoint": "http://localhost:8080/health"
+              },
+              "test_runner": {
+                "status": "$TEST_RUNNER_HEALTH",
+                "port": 5000,
+                "health_endpoint": "http://localhost:5000/health"
+              }
+            }
+          }
+          EOM
+          
+          if [[ "$API_HEALTH" == "up" && "$TEST_RUNNER_HEALTH" == "up" ]]; then
+              log "✅ All services deployed successfully!"
+              exit 0
+          else
+              log "❌ Some services failed to deploy properly"
+              log "API Server: $API_HEALTH, Test Runner: $TEST_RUNNER_HEALTH"
+              exit 1
+          fi
+          EOF
+          
+          chmod +x ./service-configs/deploy-services.sh
+          
+          echo "✅ Service configuration generated"
+      
+      - name: Upload Configuration to VM
+        run: |
+          VM_NAME="${{ steps.vm-info.outputs.vm_name }}"
+          VM_ZONE="${{ steps.vm-info.outputs.vm_zone }}"
+          
+          echo "📤 Uploading service configuration to VM..."
+          
+          # Create temporary tar file
+          tar -czf service-configs.tar.gz -C ./service-configs .
+          
+          # Upload configurations
+          gcloud compute scp service-configs.tar.gz "debian@$VM_NAME:/tmp/" --zone="$VM_ZONE"
+          
+          # Upload repositories
+          gcloud compute scp --recurse ./test-runner "debian@$VM_NAME:/tmp/" --zone="$VM_ZONE"
+          gcloud compute scp --recurse ./api-server "debian@$VM_NAME:/tmp/" --zone="$VM_ZONE"
+          
+          echo "✅ Files uploaded to VM"
+      
+      - name: Deploy Services on VM
+        id: deploy
+        run: |
+          VM_NAME="${{ steps.vm-info.outputs.vm_name }}"
+          VM_ZONE="${{ steps.vm-info.outputs.vm_zone }}"
+          
+          echo "🚀 Deploying services on VM..."
+          
+          gcloud compute ssh "debian@$VM_NAME" --zone="$VM_ZONE" --command="
+            set -e
+            
+            echo 'Setting up deployment environment...'
+            
+            # Extract configurations
+            cd /opt/test-services
+            sudo rm -rf test-runner api-server *.env docker-compose.yml deploy-services.sh 2>/dev/null || true
+            tar -xzf /tmp/service-configs.tar.gz -C .
+            
+            # Move repositories
+            sudo mv /tmp/test-runner .
+            sudo mv /tmp/api-server .
+            
+            # Set permissions
+            sudo chown -R debian:debian .
+            
+            # Set environment variables for the deployment script
+            export DEPLOYMENT_ID='${{ env.DEPLOYMENT_ID }}'
+            
+            # Run deployment script
+            echo 'Starting service deployment...'
+            ./deploy-services.sh
+          "
+          
+          if [[ $? -eq 0 ]]; then
+            echo "deploy_status=success" >> $GITHUB_OUTPUT
+            echo "✅ Services deployed successfully"
+          else
+            echo "deploy_status=failed" >> $GITHUB_OUTPUT
+            echo "❌ Service deployment failed"
+            exit 1
+          fi
+      
+      - name: Verify Service Health
+        run: |
+          VM_IP="${{ steps.vm-info.outputs.vm_ip }}"
+          
+          echo "🔍 Verifying service health from external IP..."
+          
+          sleep 30  # Allow services to stabilize
+          
+          API_STATUS="down"
+          TEST_RUNNER_STATUS="down"
+          
+          # Test API Server
+          for i in {1..6}; do
+            if curl -f -s "http://$VM_IP:8080/health" > /dev/null; then
+              API_STATUS="up"
+              echo "✅ API Server health check: PASSED (http://$VM_IP:8080/health)"
+              break
+            fi
+            echo "   API Server health check attempt $i/6..."
+            sleep 10
+          done
+          
+          # Test Test Runner
+          for i in {1..6}; do
+            if curl -f -s "http://$VM_IP:5000/health" > /dev/null; then
+              TEST_RUNNER_STATUS="up"
+              echo "✅ Test Runner health check: PASSED (http://$VM_IP:5000/health)"
+              break
+            fi
+            echo "   Test Runner health check attempt $i/6..."
+            sleep 10
+          done
+          
+          if [[ "$API_STATUS" != "up" || "$TEST_RUNNER_STATUS" != "up" ]]; then
+            echo "⚠️  Some services are not responding to external health checks"
+            echo "   API Server: $API_STATUS"
+            echo "   Test Runner: $TEST_RUNNER_STATUS"
+            echo "   Services may still be starting up or firewall rules may need time to propagate"
+          fi
+      
+      - name: Update VM Metadata
+        run: |
+          VM_IP="${{ steps.vm-info.outputs.vm_ip }}"
+          VM_NAME="${{ steps.vm-info.outputs.vm_name }}"
+          
+          # Read existing metadata and update it
+          jq --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+             --arg test_language "${{ github.event.inputs.test_language }}" \
+             --arg test_channel "${{ github.event.inputs.test_channel }}" \
+             --arg test_runner_branch "${{ github.event.inputs.test_runner_branch }}" \
+             --arg api_server_branch "${{ github.event.inputs.api_server_branch }}" \
+             --arg deployment_run_id "${{ github.run_id }}" \
+             '.services.status = "deployed" | 
+              .services.deployed = true |
+              .services.deployed_at = $deployed_at |
+              .services.configuration = {
+                "test_language": $test_language,
+                "test_channel": $test_channel,
+                "test_runner_branch": $test_runner_branch,
+                "api_server_branch": $api_server_branch
+              } |
+              .services.test_runner = {
+                "url": "http://\(.vm.external_ip):5000",
+                "health_endpoint": "http://\(.vm.external_ip):5000/health",
+                "branch": $test_runner_branch
+              } |
+              .services.api_server = {
+                "url": "http://\(.vm.external_ip):8080", 
+                "health_endpoint": "http://\(.vm.external_ip):8080/health",
+                "branch": $api_server_branch
+              } |
+              .deployment.last_service_deployment = {
+                "run_id": $deployment_run_id,
+                "deployed_at": $deployed_at,
+                "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              }' ./metadata/vm-metadata.json > vm-metadata-updated.json
+      
+      - name: Upload Updated VM Metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-metadata-${{ env.DEPLOYMENT_ID }}
+          path: vm-metadata-updated.json
+          retention-days: 30
+      
+      - name: Display Deployment Summary
+        run: |
+          VM_IP="${{ steps.vm-info.outputs.vm_ip }}"
+          VM_NAME="${{ steps.vm-info.outputs.vm_name }}"
+          VM_REGION="${{ steps.vm-info.outputs.vm_region }}"
+          
+          echo ""
+          echo "🎉 SERVICE DEPLOYMENT COMPLETED!"
+          echo "=============================================="
+          echo ""
+          echo "🖥️  INFRASTRUCTURE:"
+          echo "   VM Name: $VM_NAME"
+          echo "   Region: $VM_REGION"
+          echo "   External IP: $VM_IP"
+          echo "   Deployment ID: ${{ env.DEPLOYMENT_ID }}"
+          echo ""
+          echo "🚀 DEPLOYED SERVICES:"
+          echo "   📡 Test Runner: http://$VM_IP:5000"
+          echo "   🔧 API Server: http://$VM_IP:8080"
+          echo ""
+          echo "🧪 CURRENT CONFIGURATION:"
+          echo "   Language: ${{ github.event.inputs.test_language }}"
+          echo "   Channel: ${{ github.event.inputs.test_channel }}"
+          echo "   Test Runner Branch: ${{ github.event.inputs.test_runner_branch }}"
+          echo "   API Server Branch: ${{ github.event.inputs.api_server_branch }}"
+          echo ""
+          echo "🔗 HEALTH ENDPOINTS:"
+          echo "   API Server Health: http://$VM_IP:8080/health"
+          echo "   Test Runner Health: http://$VM_IP:5000/health"
+          echo "   VM Status: http://$VM_IP:9999/status"
+          echo ""
+          echo "📋 API ENDPOINTS FOR TESTING:"
+          echo "   POST http://$VM_IP:5000/api/v1/tests"
+          echo "   GET  http://$VM_IP:5000/api/v1/tests/{test_id}"
+          echo "   POST http://$VM_IP:5000/api/v1/messages"
+          echo ""
+          echo "🔄 REDEPLOYMENT:"
+          echo "   To change configuration (language/channel/branches),"
+          echo "   run this workflow again with force_redeploy=true"
+          echo ""
+          echo "=============================================="
